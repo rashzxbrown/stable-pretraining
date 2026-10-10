@@ -1,19 +1,4 @@
-"""EquiMod (SimCLR base) ResNet-18 on CIFAR-10.
-
-Follows the official CIFAR-10 recipe of Devillers & Lefort (ICLR 2023): 800
-epochs, batch 512, LARS lr 4.0, invariance temperature 0.5, equivariance
-temperature 0.2, lambda 1. The paper reports 92.79% linear top-1 against 90.96%
-for its SimCLR baseline, so the claim is the gap between the two. Accuracy here
-is the library's online linear probe, not the paper's 90-epoch offline linear
-evaluation, so only that gap is comparable, not the absolute numbers.
-
-``METHOD=simclr`` trains the library's SimCLR with the same optimiser, schedule
-and data pipeline (the un-augmented view is loaded but unused). Its backbone
-sees each view in a separate pass, whereas EquiMod runs one pass over
-[original, view1, view2] as in the official code, so batch-norm statistics
-differ between the two runs. Epoch count is read from the ``MAX_EPOCHS`` env
-var (default 800).
-"""
+"""EquiMod (SimCLR base) ResNet-18 training on CIFAR-10."""
 
 import os
 import sys
@@ -117,6 +102,8 @@ def main():
     sys.path.append(str(Path(__file__).parent.parent))
     from utils import get_data_dir
 
+    # METHOD=simclr trains the paired baseline with the same recipe and data
+    # pipeline; MAX_EPOCHS shortens the 800-epoch official schedule for checks.
     method = os.environ.get("METHOD", "equimod")
     max_epochs = int(os.environ.get("MAX_EPOCHS", 800))
     batch_size = 512
@@ -233,7 +220,7 @@ def main():
         accelerator="auto",
     )
 
-    manager = spt.Manager(trainer=trainer, module=module, data=data)
+    manager = spt.Manager(trainer=trainer, module=module, data=data, seed=0)
     manager()
 
 
