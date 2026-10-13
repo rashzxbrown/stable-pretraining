@@ -7,6 +7,13 @@ prediction is trained with a second NT-Xent loss, added to the usual invariance
 loss, so the backbone keeps augmentation-related information that a purely
 invariant objective would discard.
 
+Two entry points, as for SimCLR:
+
+- :class:`EquiMod`, the ``LightningModule`` with everything pre-wired.
+- :func:`stable_pretraining.forward.equimod`, the stateless forward function,
+  which composes a backbone, projector and :class:`EquivarianceModule` owned by
+  an :class:`~stable_pretraining.Module`.
+
 References:
     Devillers & Lefort. "EquiMod: An Equivariance Module to Improve
     Self-Supervised Learning." ICLR 2023. https://arxiv.org/abs/2211.01244
@@ -60,37 +67,20 @@ class EquiModOutput(SimCLROutput):
     equivariance_gain: Optional[torch.Tensor] = None
 
 
-class EquiMod(SimCLR):
-    """EquiMod: SimCLR with an augmentation-conditioned equivariance module.
+class EquivarianceModule(nn.Module):
+    """The EquiMod equivariance branch, everything after the backbone.
 
-    Architecture (on top of the SimCLR backbone and invariance projector):
-        - **Equivariance projector**: MLP mapping backbone features of the
-          un-augmented image and of both augmented views to the equivariant
-          space.
-        - **Parameter projector**: standardises the augmentation-parameter
-          vector and maps it to a small embedding.
-        - **Predictor**: maps ``[equivariant embedding of the un-augmented
-          image, parameter embedding]`` to the predicted equivariant embedding
-          of the augmented view.
-        - **Loss**: ``NT-Xent(z1, z2) + equi_weight * NT-Xent(y, y_hat)``.
-
-    Note:
-        Follows the official implementation where it differs from the paper:
-        the equivariance loss is a standard NT-Xent over ``[y, y_hat]``, so
-        the other view of the same image and the other predictions act as
-        negatives (Eq. 4 of the paper excludes the sibling view). The
-        projectors and the predictor reuse SimCLR's projector builder, whose
-        final batch norm has a learnable scale (official: ``affine=False``).
+    Holds the equivariance projector, the augmentation-parameter projector and
+    the predictor, and knows how to read the augmentation parameters that the
+    library's transforms record in each view. It is the one extra attribute an
+    :class:`~stable_pretraining.Module` needs to run
+    :func:`stable_pretraining.forward.equimod`; :class:`EquiMod` owns one as
+    ``self.equi``.
 
     Args:
-        encoder_name: timm model name or a pre-instantiated ``nn.Module``
-            whose ``forward`` returns a ``[B, D]`` tensor.
-        projector_dims: Hidden + output dimensions of the invariance projector.
-        temperature: Temperature of the invariance NT-Xent loss.
-        equi_projector_dims: Hidden + output dimensions of the equivariance
+        embed_dim: Backbone output dimension.
+        projector_dims: Hidden + output dimensions of the equivariance
             projector.
-        equi_temperature: Temperature of the equivariance NT-Xent loss.
-        equi_weight: Weight ``lambda`` of the equivariance loss.
         param_dim: Size of the augmentation-parameter vector (15 for
             crop + flip + colour jitter + grayscale, 17 with Gaussian blur).
         param_projector_dims: Hidden + output dimensions of the parameter
@@ -100,61 +90,37 @@ class EquiMod(SimCLR):
         param_stats: Optional ``(mean, std)`` of the parameter vector, each a
             tensor or sequence of length ``param_dim``, used to standardise
             it. If ``None``, a non-affine batch norm standardises it instead.
-        low_resolution: Adapt first conv for 32x32 inputs (CIFAR-style).
-        pretrained: Load pretrained timm weights for the encoder.
-
-    Example::
-
-        model = EquiMod(encoder_name="resnet18", low_resolution=True)
-
-        original = torch.randn(64, 3, 32, 32)
-        v1, v2 = torch.randn(64, 3, 32, 32), torch.randn(64, 3, 32, 32)
-        p1, p2 = torch.randn(64, 15), torch.randn(64, 15)
-        out = model(v1, v2, original, p1, p2)
-        out.loss.backward()
-
-        # eval: single view, no loss
-        model.eval()
-        features = model(v1).embedding  # [64, embed_dim]
+        weight: Weight ``lambda`` of the equivariance loss in the total loss.
+        param_keys: Optional keyword overrides for :meth:`augmentation_params`
+            (e.g. ``{"blur": "PILGaussianBlur"}``), used by
+            :meth:`params_from_view`.
     """
 
     def __init__(
         self,
-        encoder_name: Union[str, nn.Module] = "vit_small_patch16_224",
+        embed_dim: int,
         projector_dims: Sequence[int] = (2048, 2048, 128),
-        temperature: float = 0.5,
-        equi_projector_dims: Sequence[int] = (2048, 2048, 128),
-        equi_temperature: float = 0.2,
-        equi_weight: float = 1.0,
         param_dim: int = 15,
         param_projector_dims: Sequence[int] = (128,),
         predictor_hidden_dims: Sequence[int] = (),
         param_stats: Optional[Tuple[_Stats, _Stats]] = None,
-        low_resolution: bool = False,
-        pretrained: bool = False,
+        weight: float = 1.0,
+        param_keys: Optional[Mapping[str, Optional[str]]] = None,
     ):
-        super().__init__(
-            encoder_name=encoder_name,
-            projector_dims=projector_dims,
-            temperature=temperature,
-            low_resolution=low_resolution,
-            pretrained=pretrained,
-        )
-        self.equi_weight = equi_weight
+        super().__init__()
+        self.weight = weight
         self.param_dim = param_dim
+        self.param_keys = dict(param_keys or {})
 
-        self.equi_projector = _build_projector(
-            self.embed_dim, list(equi_projector_dims)
-        )
-        equi_dim = list(equi_projector_dims)[-1]
+        self.projector = _build_projector(embed_dim, list(projector_dims))
+        out_dim = list(projector_dims)[-1]
         self.param_projector = _build_projector(
             param_dim, list(param_projector_dims), final_bn_no_bias=False
         )
         self.predictor = _build_projector(
-            equi_dim + list(param_projector_dims)[-1],
-            [*predictor_hidden_dims, equi_dim],
+            out_dim + list(param_projector_dims)[-1],
+            [*predictor_hidden_dims, out_dim],
         )
-        self.equi_loss = NTXEntLoss(temperature=equi_temperature)
 
         if param_stats is None:
             self.param_norm = nn.BatchNorm1d(param_dim, affine=False)
@@ -235,7 +201,12 @@ class EquiMod(SimCLR):
             parts += [(sigma > 0).float(), sigma]
         return torch.cat(parts, dim=1)
 
-    def _normalize_params(self, params: torch.Tensor) -> torch.Tensor:
+    def params_from_view(self, view: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        """:meth:`augmentation_params` with this module's ``param_keys`` applied."""
+        return self.augmentation_params(view, **self.param_keys)
+
+    def normalize_params(self, params: torch.Tensor) -> torch.Tensor:
+        """Standardise the raw parameter vector, [N, param_dim]."""
         if params.shape[-1] != self.param_dim:
             raise ValueError(
                 f"expected augmentation parameters of size {self.param_dim} "
@@ -245,6 +216,152 @@ class EquiMod(SimCLR):
         if self.param_norm is not None:
             return self.param_norm(params)
         return (params - self.param_mean) / self.param_std
+
+    def forward(
+        self,
+        h_original: torch.Tensor,
+        h_views: torch.Tensor,
+        params: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Predict the augmented views' equivariant embeddings.
+
+        Args:
+            h_original: Backbone features of the un-augmented images, [B, D].
+            h_views: Backbone features of the augmented views, [V*B, D],
+                view-major (all of view 1, then all of view 2, ...).
+            params: Augmentation parameters in the same order, [V*B, param_dim].
+
+        Returns:
+            ``(y_views, y_hat, gain)``: the views' equivariant embeddings
+            [V*B, K], their predictions [V*B, K], and the detached mean of
+            ``cos(y, y_hat) - cos(y, y_original)``.
+        """
+        B = h_original.shape[0]
+        # One projector pass over [original, views] so batch-norm statistics
+        # are shared by all of them, as in the official implementation.
+        y = self.projector(torch.cat([h_original, h_views], dim=0))
+        y_original = y[:B].repeat(h_views.shape[0] // B, 1)
+        y_views = y[B:]
+        p = self.param_projector(self.normalize_params(params))
+        y_hat = self.predictor(torch.cat([y_original, p], dim=1))
+        with torch.no_grad():
+            gain = (
+                F.cosine_similarity(y_views, y_hat)
+                - F.cosine_similarity(y_views, y_original)
+            ).mean()
+        return y_views, y_hat, gain
+
+
+class EquiMod(SimCLR):
+    """EquiMod: SimCLR with an augmentation-conditioned equivariance module.
+
+    Architecture (on top of the SimCLR backbone and invariance projector):
+        - **Equivariance projector**: MLP mapping backbone features of the
+          un-augmented image and of both augmented views to the equivariant
+          space.
+        - **Parameter projector**: standardises the augmentation-parameter
+          vector and maps it to a small embedding.
+        - **Predictor**: maps ``[equivariant embedding of the un-augmented
+          image, parameter embedding]`` to the predicted equivariant embedding
+          of the augmented view.
+        - **Loss**: ``NT-Xent(z1, z2) + equi_weight * NT-Xent(y, y_hat)``.
+
+    The three heads live in ``self.equi``, an :class:`EquivarianceModule`,
+    so the same instance also runs under
+    :func:`stable_pretraining.forward.equimod`.
+
+    Note:
+        Follows the official implementation where it differs from the paper:
+        the equivariance loss is a standard NT-Xent over ``[y, y_hat]``, so
+        the other view of the same image and the other predictions act as
+        negatives (Eq. 4 of the paper excludes the sibling view). The
+        projectors and the predictor reuse SimCLR's projector builder, whose
+        final batch norm has a learnable scale (official: ``affine=False``).
+
+    Args:
+        encoder_name: timm model name or a pre-instantiated ``nn.Module``
+            whose ``forward`` returns a ``[B, D]`` tensor.
+        projector_dims: Hidden + output dimensions of the invariance projector.
+        temperature: Temperature of the invariance NT-Xent loss.
+        equi_projector_dims: Hidden + output dimensions of the equivariance
+            projector.
+        equi_temperature: Temperature of the equivariance NT-Xent loss.
+        equi_weight: Weight ``lambda`` of the equivariance loss.
+        param_dim: Size of the augmentation-parameter vector (15 for
+            crop + flip + colour jitter + grayscale, 17 with Gaussian blur).
+        param_projector_dims: Hidden + output dimensions of the parameter
+            projector.
+        predictor_hidden_dims: Hidden dimensions of the predictor. Empty gives
+            the single linear layer used in the paper.
+        param_stats: Optional ``(mean, std)`` of the parameter vector, each a
+            tensor or sequence of length ``param_dim``, used to standardise
+            it. If ``None``, a non-affine batch norm standardises it instead.
+        low_resolution: Adapt first conv for 32x32 inputs (CIFAR-style).
+        pretrained: Load pretrained timm weights for the encoder.
+
+    Example::
+
+        model = EquiMod(encoder_name="resnet18", low_resolution=True)
+
+        original = torch.randn(64, 3, 32, 32)
+        v1, v2 = torch.randn(64, 3, 32, 32), torch.randn(64, 3, 32, 32)
+        p1, p2 = torch.randn(64, 15), torch.randn(64, 15)
+        out = model(v1, v2, original, p1, p2)
+        out.loss.backward()
+
+        # eval: single view, no loss
+        model.eval()
+        features = model(v1).embedding  # [64, embed_dim]
+    """
+
+    def __init__(
+        self,
+        encoder_name: Union[str, nn.Module] = "vit_small_patch16_224",
+        projector_dims: Sequence[int] = (2048, 2048, 128),
+        temperature: float = 0.5,
+        equi_projector_dims: Sequence[int] = (2048, 2048, 128),
+        equi_temperature: float = 0.2,
+        equi_weight: float = 1.0,
+        param_dim: int = 15,
+        param_projector_dims: Sequence[int] = (128,),
+        predictor_hidden_dims: Sequence[int] = (),
+        param_stats: Optional[Tuple[_Stats, _Stats]] = None,
+        low_resolution: bool = False,
+        pretrained: bool = False,
+    ):
+        super().__init__(
+            encoder_name=encoder_name,
+            projector_dims=projector_dims,
+            temperature=temperature,
+            low_resolution=low_resolution,
+            pretrained=pretrained,
+        )
+        self.equi = EquivarianceModule(
+            self.embed_dim,
+            projector_dims=equi_projector_dims,
+            param_dim=param_dim,
+            param_projector_dims=param_projector_dims,
+            predictor_hidden_dims=predictor_hidden_dims,
+            param_stats=param_stats,
+            weight=equi_weight,
+        )
+        self.equi_loss = NTXEntLoss(temperature=equi_temperature)
+
+    augmentation_params = staticmethod(EquivarianceModule.augmentation_params)
+
+    @property
+    def equi_weight(self) -> float:
+        """Weight ``lambda`` of the equivariance loss."""
+        return self.equi.weight
+
+    @equi_weight.setter
+    def equi_weight(self, value: float) -> None:
+        self.equi.weight = value
+
+    @property
+    def param_dim(self) -> int:
+        """Size of the augmentation-parameter vector."""
+        return self.equi.param_dim
 
     def forward(
         self,
@@ -289,23 +406,13 @@ class EquiMod(SimCLR):
         z = self.projector(h[B:])
         invariance_loss = self.simclr_loss(z[:B], z[B:])
 
-        y = self.equi_projector(h)
-        y_original = y[:B].repeat(2, 1)
-        y_views = y[B:]
-        p = self.param_projector(
-            self._normalize_params(torch.cat([params1, params2], dim=0))
+        y_views, y_hat, gain = self.equi(
+            h[:B], h[B:], torch.cat([params1, params2], dim=0)
         )
-        y_hat = self.predictor(torch.cat([y_original, p], dim=1))
         equivariance_loss = self.equi_loss(y_views, y_hat)
 
-        with torch.no_grad():
-            gain = (
-                F.cosine_similarity(y_views, y_hat)
-                - F.cosine_similarity(y_views, y_original)
-            ).mean()
-
         return EquiModOutput(
-            loss=invariance_loss + self.equi_weight * equivariance_loss,
+            loss=invariance_loss + self.equi.weight * equivariance_loss,
             embedding=h[B:],
             projection=z,
             invariance_loss=invariance_loss.detach(),

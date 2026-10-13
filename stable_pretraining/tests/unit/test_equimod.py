@@ -165,19 +165,21 @@ def test_augmentation_params_missing_record_raises():
 def _hooks(model: EquiMod) -> dict:
     """Record what the equivariance module sees and produces."""
     seen = {}
-    model.equi_projector.register_forward_hook(
+    model.equi.projector.register_forward_hook(
         lambda m, i, o: seen.update(y=o.detach())
     )
-    model.param_projector.register_forward_pre_hook(
+    model.equi.param_projector.register_forward_pre_hook(
         lambda m, i: seen.update(param_in=i[0].detach())
     )
-    model.param_projector.register_forward_hook(
+    model.equi.param_projector.register_forward_hook(
         lambda m, i, o: seen.update(param_out=o.detach())
     )
-    model.predictor.register_forward_pre_hook(
+    model.equi.predictor.register_forward_pre_hook(
         lambda m, i: seen.update(predictor_in=i[0].detach())
     )
-    model.predictor.register_forward_hook(lambda m, i, o: seen.update(y_hat=o.detach()))
+    model.equi.predictor.register_forward_hook(
+        lambda m, i, o: seen.update(y_hat=o.detach())
+    )
     return seen
 
 
@@ -268,8 +270,15 @@ def test_equivariance_loss_trains_every_new_module():
     model = _model().train()
     (original, v1, v2), (p1, p2) = _inputs()
     model(v1, v2, original, p1, p2).loss.backward()
-    for name in ("equi_projector", "param_projector", "predictor", "backbone"):
-        grads = [p.grad for p in getattr(model, name).parameters() if p.requires_grad]
+    for name in (
+        "equi.projector",
+        "equi.param_projector",
+        "equi.predictor",
+        "backbone",
+    ):
+        grads = [
+            p.grad for p in model.get_submodule(name).parameters() if p.requires_grad
+        ]
         assert any(g is not None and g.abs().sum() > 1e-4 for g in grads), name
 
 
@@ -291,7 +300,7 @@ def test_zero_weight_removes_equivariance_gradient():
     out = model(v1, v2, original, p1, p2)
     assert torch.allclose(out.loss, out.invariance_loss)
     out.loss.backward()
-    for p in model.predictor.parameters():
+    for p in model.equi.predictor.parameters():
         assert p.grad is None or p.grad.abs().sum() == 0
 
 
@@ -316,16 +325,16 @@ def test_eval_single_view_returns_embedding_only():
 def test_fixed_param_stats_standardise_parameters():
     mean, std = torch.full((15,), 2.0), torch.full((15,), 4.0)
     model = _model(param_stats=(mean, std))
-    assert model.param_norm is None
-    assert "param_mean" in dict(model.named_buffers())
+    assert model.equi.param_norm is None
+    assert "equi.param_mean" in dict(model.named_buffers())
     params = torch.full((3, 15), 6.0)
-    assert torch.allclose(model._normalize_params(params), torch.ones(3, 15))
+    assert torch.allclose(model.equi.normalize_params(params), torch.ones(3, 15))
 
 
 def test_default_param_norm_is_non_affine_batch_norm():
     model = _model()
-    assert isinstance(model.param_norm, nn.BatchNorm1d)
-    assert not model.param_norm.affine
+    assert isinstance(model.equi.param_norm, nn.BatchNorm1d)
+    assert not model.equi.param_norm.affine
 
 
 def test_param_stats_shape_mismatch_raises():

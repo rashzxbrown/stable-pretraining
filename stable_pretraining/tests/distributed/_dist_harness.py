@@ -658,3 +658,98 @@ def w_clip_crossgpu_matches_global(rank, world_size):
 
     ref = _ref_clip_global(feats_i_global, feats_j_global, 0.07)
     assert torch.allclose(avg, ref, atol=1e-5), (avg, ref)
+
+
+# ---------------------------------------------------------------------------
+# EquiMod
+# ---------------------------------------------------------------------------
+
+
+def _tiny_equimod(seed: int = 0):
+    """Small EquiMod with identical initialisation on every rank."""
+    from stable_pretraining.methods import EquiMod
+
+    torch.manual_seed(seed)
+    encoder = nn.Sequential(
+        nn.Conv2d(3, 8, kernel_size=3, stride=2),
+        nn.BatchNorm2d(8),
+        nn.AdaptiveAvgPool2d(1),
+        nn.Flatten(),
+    )
+    return EquiMod(
+        encoder_name=encoder,
+        projector_dims=(16, 8),
+        equi_projector_dims=(16, 8),
+        param_projector_dims=(8,),
+    )
+
+
+def _equimod_batch(seed: int, n: int):
+    g = torch.Generator().manual_seed(seed)
+    images = [torch.randn(n, 3, 32, 32, generator=g) for _ in range(3)]
+    params = [torch.randn(n, 15, generator=g) for _ in range(2)]
+    return images, params
+
+
+def w_equimod_ddp_step_keeps_ranks_in_sync(rank, world_size):
+    """A DDP-wrapped EquiMod step leaves identical parameters on every rank.
+
+    Each rank sees different data; after backward + optimizer step the
+    gradient all-reduce must have kept the replicas in lockstep, and every
+    trainable parameter (backbone and all three equivariance heads) must have
+    received a gradient so DDP's reducer never waits on an unused one.
+    """
+    from torch.nn.parallel import DistributedDataParallel
+
+    from stable_pretraining.utils import all_gather
+
+    model = _tiny_equimod(seed=0).train()
+    ddp = DistributedDataParallel(model)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+
+    (original, v1, v2), (p1, p2) = _equimod_batch(seed=rank + 1, n=4)
+    out = ddp(v1, v2, original, p1, p2)
+    assert out.loss.ndim == 0 and torch.isfinite(out.loss), out.loss
+    out.loss.backward()
+    missing = [
+        n for n, p in model.named_parameters() if p.requires_grad and p.grad is None
+    ]
+    assert not missing, missing
+    opt.step()
+
+    flat = torch.cat([p.detach().flatten() for p in model.parameters()])
+    gathered = all_gather(flat.clone())
+    for other in gathered:
+        assert torch.allclose(other, flat, atol=1e-6)
+
+
+def w_equimod_equi_loss_crossgpu_matches_global(rank, world_size):
+    """Mean of per-rank equivariance NT-Xent == single-process loss on the global batch.
+
+    The equivariance loss contrasts each view's embedding against its
+    prediction with negatives gathered from all ranks. With identical heads
+    on every rank (eval mode, so batch norm uses running statistics and the
+    outputs of a slice equal the slice of the outputs), the mean of the
+    per-rank losses must recover the single-process loss over the whole batch.
+    """
+    from stable_pretraining.losses import NTXEntLoss
+    from stable_pretraining.utils import all_reduce
+
+    model = _tiny_equimod(seed=0).eval()
+    n = 4
+    (original, v1, v2), (p1, p2) = _equimod_batch(seed=0, n=n * world_size)
+
+    def embed(orig, a, b, pa, pb):
+        B = orig.shape[0]
+        h = model.backbone(torch.cat([orig, a, b]))
+        return model.equi(h[:B], h[B:], torch.cat([pa, pb]))
+
+    with torch.no_grad():
+        sl = slice(rank * n, (rank + 1) * n)
+        y_views, y_hat, _ = embed(original[sl], v1[sl], v2[sl], p1[sl], p2[sl])
+        local = NTXEntLoss(temperature=0.2)(y_views, y_hat)
+        avg = all_reduce(local.clone()) / world_size
+
+        y_views_g, y_hat_g, _ = embed(original, v1, v2, p1, p2)
+        ref = _ref_ntxent_global(y_views_g, y_hat_g, 0.2)
+    assert torch.allclose(avg, ref, atol=1e-5), (avg.item(), ref.item())

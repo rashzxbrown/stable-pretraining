@@ -13,6 +13,7 @@ import torchvision
 from torchvision.transforms import InterpolationMode
 
 import stable_pretraining as spt
+from stable_pretraining import forward
 from stable_pretraining.data import transforms
 from stable_pretraining.methods import EquiMod, SimCLR
 
@@ -51,51 +52,11 @@ def _original_view():
     )
 
 
-def equimod_forward(self, batch, stage):
-    """Forward for EquiMod and its SimCLR baseline.
-
-    Batch format:
-        - Training: ``{"views": [original, view1, view2]}``; each augmented
-          view carries the parameters its transforms sampled.
-        - Eval: single dict with ``"image"`` key.
-
-    Returns:
-        Dictionary with ``"loss"`` (training only), ``"embedding"`` and
-        ``"label"``.
-    """
-    if "image" in batch:
-        output = SimCLR.forward(self, batch["image"])
-        return {"embedding": output.embedding, "label": batch["label"].long()}
-
-    original, view1, view2 = batch["views"]
-    if isinstance(self, EquiMod):
-        output = EquiMod.forward(
-            self,
-            view1["image"],
-            view2["image"],
-            original["image"],
-            EquiMod.augmentation_params(view1),
-            EquiMod.augmentation_params(view2),
-        )
-        self.log_dict(
-            {
-                f"{stage}/inv": output.invariance_loss,
-                f"{stage}/equi": output.equivariance_loss,
-                f"{stage}/equi_gain": output.equivariance_gain,
-            },
-            on_step=True,
-            on_epoch=True,
-            sync_dist=True,
-        )
-    else:
-        output = SimCLR.forward(self, view1["image"], view2["image"])
-
-    self.log(f"{stage}/loss", output.loss, on_step=True, on_epoch=True, sync_dist=True)
-    return {
-        "loss": output.loss,
-        "embedding": output.embedding.detach(),
-        "label": torch.cat([view1["label"], view2["label"]], dim=0).long(),
-    }
+def simclr_two_views(self, batch, stage):
+    """SimCLR baseline on the same three-view pipeline: drops the un-augmented view."""
+    if "views" in batch:
+        batch = {"views": batch["views"][1:]}
+    return forward.simclr(self, batch, stage)
 
 
 def main():
@@ -163,7 +124,9 @@ def main():
     else:
         raise ValueError(f"METHOD must be 'equimod' or 'simclr', got {method!r}")
 
-    module.forward = types.MethodType(equimod_forward, module)
+    module.forward = types.MethodType(
+        forward.equimod if method == "equimod" else simclr_two_views, module
+    )
     module.optim = {
         "optimizer": {
             "type": "LARS",

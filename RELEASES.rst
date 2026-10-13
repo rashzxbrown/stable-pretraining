@@ -8,9 +8,13 @@ Unreleased
   Lefort, "EquiMod: An Equivariance Module to Improve Self-Supervised Learning"
   (ICLR 2023). A second projector and an augmentation-conditioned predictor map
   the embedding of the un-augmented image to the embedding of each augmented
-  view, trained with a second NT-Xent loss. ``EquiMod.augmentation_params``
-  assembles the parameter vector from the records the transforms already write
-  into each view. Registered in ``stable_pretraining.methods`` and
+  view, trained with a second NT-Xent loss. The heads live in a reusable
+  ``EquivarianceModule`` whose ``augmentation_params`` assembles the parameter
+  vector from the records the transforms already write into each view. Ships
+  as both the ``EquiMod`` method class and the ``forward.equimod`` forward
+  function (three views: ``[un-augmented, augmented, augmented]``), with unit,
+  CPU Manager training/requeue-resume (regression) and two-process DDP
+  (distributed) tests. Registered in ``stable_pretraining.methods`` and
   ``METHODS.md``, with a CIFAR-10 ResNet-18 benchmark under
   ``benchmarks/cifar10/equimod-resnet18.py`` (800 epochs, official recipe:
   92.46% online linear top-1 vs 91.53% for the paired SimCLR baseline).
