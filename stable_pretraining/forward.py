@@ -1278,9 +1278,7 @@ def equimod(self, batch: dict[str, Any], stage: str) -> dict[str, torch.Tensor]:
             - backbone: Feature extraction network
             - projector: Projection head for the invariance loss
             - simclr_loss: NT-Xent loss for the invariance term
-            - equi: :class:`~stable_pretraining.methods.equimod.EquivarianceModule`
-              (equivariance projector, parameter projector, predictor and the
-              loss weight ``lambda``)
+            - equi: EquivarianceModule (heads, parameter projector, loss weight)
             - equi_loss: NT-Xent loss for the equivariance term
         batch: A list of exactly three view dicts (from MultiViewTransform):
             ``[un-augmented, augmented, augmented]``. The two augmented views
