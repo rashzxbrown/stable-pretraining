@@ -1294,10 +1294,9 @@ def equimod(self, batch: dict[str, Any], stage: str) -> dict[str, torch.Tensor]:
             - 'label': Labels if present (for probes/callbacks)
 
     Note:
-        Introduced by Devillers & Lefort, "EquiMod: An Equivariance Module to
-        Improve Self-Supervised Learning" (ICLR 2023). The backbone runs once
-        over ``[original, view1, view2]`` so batch-norm statistics are shared,
-        as in the official implementation.
+        Introduced in the EquiMod paper :cite:`devillers2023equimod`. The
+        backbone runs once over ``[original, view1, view2]`` so batch-norm
+        statistics are shared, as in the official implementation.
 
     Example:
         ::
@@ -1321,6 +1320,8 @@ def equimod(self, batch: dict[str, Any], stage: str) -> dict[str, torch.Tensor]:
 
     views = _get_views_list(batch)
     if views is not None:
+        if isinstance(views, dict):  # named views: keep insertion order
+            views = list(views.values())
         if len(views) != 3:
             raise ValueError(
                 f"EquiMod requires exactly 3 views [original, view1, view2], got "

@@ -179,13 +179,23 @@ class EquivarianceModule(nn.Module):
         Returns:
             Float tensor of shape ``[B, P]``.
         """
+
+        def record_of(key: str) -> torch.Tensor:
+            if key not in view:
+                raise KeyError(
+                    f"view carries no {key!r} parameter record (keys: "
+                    f"{sorted(view)}); add that transform to the augmented "
+                    "pipelines or pass None for it"
+                )
+            return view[key].float()
+
         parts = []
         if crop is not None:
-            parts.append(view[crop].float())
+            parts.append(record_of(crop))
         if flip is not None:
-            parts.append(view[flip].float().unsqueeze(1))
+            parts.append(record_of(flip).unsqueeze(1))
         if jitter is not None:
-            record = view[jitter].float()
+            record = record_of(jitter)
             factors, order = record[:, :4], record[:, 4:]
             # ``order`` is a permutation of 0..3 when applied, all zeros when skipped
             applied = order.sum(dim=1, keepdim=True) > 0
@@ -193,10 +203,10 @@ class EquivarianceModule(nn.Module):
             order = torch.where(applied, order, order.new_tensor([0, 1, 2, 3]))
             parts += [applied.float(), order, factors]
         if grayscale is not None:
-            parts.append(view[grayscale].float().unsqueeze(1))
+            parts.append(record_of(grayscale).unsqueeze(1))
         if blur is not None:
             # GaussianBlur records (sigma_x, sigma_y), always equal
-            record = view[blur].float()
+            record = record_of(blur)
             sigma = record.reshape(record.shape[0], -1)[:, :1]
             parts += [(sigma > 0).float(), sigma]
         return torch.cat(parts, dim=1)
@@ -237,10 +247,16 @@ class EquivarianceModule(nn.Module):
             ``cos(y, y_hat) - cos(y, y_original)``.
         """
         B = h_original.shape[0]
+        n_views, remainder = divmod(h_views.shape[0], B)
+        if remainder:
+            raise ValueError(
+                f"h_views has {h_views.shape[0]} rows, not a multiple of the "
+                f"{B} un-augmented images; expected view-major [V*B, D]"
+            )
         # One projector pass over [original, views] so batch-norm statistics
         # are shared by all of them, as in the official implementation.
         y = self.projector(torch.cat([h_original, h_views], dim=0))
-        y_original = y[:B].repeat(h_views.shape[0] // B, 1)
+        y_original = y[:B].repeat(n_views, 1)
         y_views = y[B:]
         p = self.param_projector(self.normalize_params(params))
         y_hat = self.predictor(torch.cat([y_original, p], dim=1))
@@ -296,6 +312,10 @@ class EquiMod(SimCLR):
         param_stats: Optional ``(mean, std)`` of the parameter vector, each a
             tensor or sequence of length ``param_dim``, used to standardise
             it. If ``None``, a non-affine batch norm standardises it instead.
+        param_keys: Optional keyword overrides for
+            :meth:`EquivarianceModule.augmentation_params` (e.g.
+            ``{"blur": "PILGaussianBlur"}`` with ``param_dim=17``), used when
+            the model is driven by :func:`stable_pretraining.forward.equimod`.
         low_resolution: Adapt first conv for 32x32 inputs (CIFAR-style).
         pretrained: Load pretrained timm weights for the encoder.
 
@@ -326,6 +346,7 @@ class EquiMod(SimCLR):
         param_projector_dims: Sequence[int] = (128,),
         predictor_hidden_dims: Sequence[int] = (),
         param_stats: Optional[Tuple[_Stats, _Stats]] = None,
+        param_keys: Optional[Mapping[str, Optional[str]]] = None,
         low_resolution: bool = False,
         pretrained: bool = False,
     ):
@@ -344,6 +365,7 @@ class EquiMod(SimCLR):
             predictor_hidden_dims=predictor_hidden_dims,
             param_stats=param_stats,
             weight=equi_weight,
+            param_keys=param_keys,
         )
         self.equi_loss = NTXEntLoss(temperature=equi_temperature)
 

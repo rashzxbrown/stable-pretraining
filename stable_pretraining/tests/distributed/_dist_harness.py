@@ -724,32 +724,33 @@ def w_equimod_ddp_step_keeps_ranks_in_sync(rank, world_size):
 
 
 def w_equimod_equi_loss_crossgpu_matches_global(rank, world_size):
-    """Mean of per-rank equivariance NT-Xent == single-process loss on the global batch.
+    """Mean of per-rank EquiMod losses == single-process losses on the global batch.
 
-    The equivariance loss contrasts each view's embedding against its
-    prediction with negatives gathered from all ranks. With identical heads
-    on every rank (eval mode, so batch norm uses running statistics and the
-    outputs of a slice equal the slice of the outputs), the mean of the
-    per-rank losses must recover the single-process loss over the whole batch.
+    ``EquiMod.forward`` contrasts each view's embedding against its prediction
+    (and the two views against each other) with negatives gathered from all
+    ranks. With identical weights on every rank (eval mode, so batch norm uses
+    running statistics and the outputs of a slice equal the slice of the
+    outputs), the mean of the per-rank losses must recover the single-process
+    losses over the whole batch — for both the equivariance and the invariance
+    term, through the real forward.
     """
-    from stable_pretraining.losses import NTXEntLoss
     from stable_pretraining.utils import all_reduce
 
     model = _tiny_equimod(seed=0).eval()
     n = 4
     (original, v1, v2), (p1, p2) = _equimod_batch(seed=0, n=n * world_size)
 
-    def embed(orig, a, b, pa, pb):
-        B = orig.shape[0]
-        h = model.backbone(torch.cat([orig, a, b]))
-        return model.equi(h[:B], h[B:], torch.cat([pa, pb]))
-
     with torch.no_grad():
         sl = slice(rank * n, (rank + 1) * n)
-        y_views, y_hat, _ = embed(original[sl], v1[sl], v2[sl], p1[sl], p2[sl])
-        local = NTXEntLoss(temperature=0.2)(y_views, y_hat)
-        avg = all_reduce(local.clone()) / world_size
+        out = model(v1[sl], v2[sl], original[sl], p1[sl], p2[sl])
+        avg_equi = all_reduce(out.equivariance_loss.clone()) / world_size
+        avg_inv = all_reduce(out.invariance_loss.clone()) / world_size
 
-        y_views_g, y_hat_g, _ = embed(original, v1, v2, p1, p2)
-        ref = _ref_ntxent_global(y_views_g, y_hat_g, 0.2)
-    assert torch.allclose(avg, ref, atol=1e-5), (avg.item(), ref.item())
+        B = original.shape[0]
+        h = model.backbone(torch.cat([original, v1, v2]))
+        z = model.projector(h[B:])
+        y_views, y_hat, _ = model.equi(h[:B], h[B:], torch.cat([p1, p2]))
+        ref_equi = _ref_ntxent_global(y_views, y_hat, model.equi_loss.temperature)
+        ref_inv = _ref_ntxent_global(z[:B], z[B:], model.simclr_loss.temperature)
+    assert torch.allclose(avg_equi, ref_equi, atol=1e-5), (avg_equi, ref_equi)
+    assert torch.allclose(avg_inv, ref_inv, atol=1e-5), (avg_inv, ref_inv)

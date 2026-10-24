@@ -7,6 +7,7 @@ per-epoch checkpoint and reproduces the uninterrupted run.
 """
 
 import json
+import signal
 import types
 
 import lightning as pl
@@ -14,7 +15,6 @@ import pytest
 import torch
 import torch.nn as nn
 import torchmetrics
-from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, Dataset
 
 import stable_pretraining as spt
@@ -45,7 +45,7 @@ class FakeThreeViewDataset(Dataset):
         self.labels = torch.randint(0, NUM_CLASSES, (num_samples,), generator=g)
         self.views = []
         for _ in range(2):
-            noise = torch.randn_like(self.images) * 0.1
+            noise = torch.randn_like(self.images, generator=g) * 0.1
             crop = torch.stack(
                 [
                     torch.randint(0, 8, (num_samples,), generator=g),
@@ -154,6 +154,11 @@ def build_method_class():
 
 BUILDERS = {"module": build_composable_module, "method_class": build_method_class}
 
+# fit/loss_epoch after one seeded epoch of test_equimod_trains_under_manager
+# (captured on CPU; re-capture by printing ``summary["fit/loss_epoch"]`` there).
+# If this drifts, the forward, loss or optimisation logic changed.
+REFERENCE_LOSS = {"module": 6.997955322265625, "method_class": 6.734986305236816}
+
 TRAINER = {
     "accelerator": "cpu",
     "enable_checkpointing": False,
@@ -163,10 +168,23 @@ TRAINER = {
 }
 
 
-def make_trainer_cfg(max_epochs):
-    return OmegaConf.create(
-        {"_target_": "lightning.Trainer", "max_epochs": max_epochs, **TRAINER}
+def make_trainer(max_epochs, callbacks=()):
+    return pl.Trainer(
+        max_epochs=max_epochs, callbacks=list(callbacks), logger=False, **TRAINER
     )
+
+
+@pytest.fixture
+def restore_signals():
+    """Snapshot SIGTERM/SIGUSR2 and restore them after the test.
+
+    With ``SLURM_JOB_ID`` set, ``Manager`` installs a process-global SIGTERM
+    forwarder; left in place it would outlive the test and poison the runner.
+    """
+    prior = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGUSR2)}
+    yield
+    for sig, handler in prior.items():
+        signal.signal(sig, handler)
 
 
 class _PreemptAfterFirstEpoch(pl.Callback):
@@ -206,7 +224,7 @@ def test_equimod_trains_under_manager(entry_point):
         loss=nn.CrossEntropyLoss(),
         metrics={"top1": torchmetrics.classification.MulticlassAccuracy(NUM_CLASSES)},
     )
-    trainer = pl.Trainer(max_epochs=1, callbacks=[probe], logger=False, **TRAINER)
+    trainer = make_trainer(max_epochs=1, callbacks=[probe])
     manager = Manager(trainer=trainer, module=module, data=make_data(), seed=SEED)
     manager()
 
@@ -221,18 +239,23 @@ def test_equimod_trains_under_manager(entry_point):
         assert key in summary, (key, sorted(summary))
         assert torch.isfinite(torch.tensor(summary[key]))
     assert summary["fit/loss_epoch"] > summary["fit/inv_epoch"]
+    assert summary["fit/loss_epoch"] == pytest.approx(
+        REFERENCE_LOSS[entry_point], abs=1e-3
+    ), f"{entry_point}: loss drifted from the reference value"
     assert "eval/linear_probe_top1_epoch" in summary, sorted(summary)
 
 
 @pytest.mark.parametrize("entry_point", list(BUILDERS))
-def test_equimod_requeue_resumes_and_matches_uninterrupted(entry_point, monkeypatch):
+def test_equimod_requeue_resumes_and_matches_uninterrupted(
+    entry_point, monkeypatch, restore_signals
+):
     """A SLURM requeue resumes from last.ckpt and ends where a 2-epoch run ends."""
     builder = BUILDERS[entry_point]
 
     # Reference: two uninterrupted epochs.
     reference = builder()
     reference_manager = Manager(
-        trainer=make_trainer_cfg(max_epochs=2),
+        trainer=make_trainer(max_epochs=2),
         module=reference,
         data=make_data(),
         seed=SEED,
@@ -246,9 +269,7 @@ def test_equimod_requeue_resumes_and_matches_uninterrupted(entry_point, monkeypa
     monkeypatch.delenv("SLURM_ARRAY_TASK_ID", raising=False)
     monkeypatch.delenv("SLURM_RESTART_COUNT", raising=False)
     first = Manager(
-        trainer=pl.Trainer(
-            max_epochs=2, callbacks=[_PreemptAfterFirstEpoch()], logger=False, **TRAINER
-        ),
+        trainer=make_trainer(max_epochs=2, callbacks=[_PreemptAfterFirstEpoch()]),
         module=builder(),
         data=make_data(),
         seed=SEED,
@@ -265,7 +286,7 @@ def test_equimod_requeue_resumes_and_matches_uninterrupted(entry_point, monkeypa
     monkeypatch.setenv("SLURM_RESTART_COUNT", "1")
     resumed = builder()
     second = Manager(
-        trainer=make_trainer_cfg(max_epochs=2),
+        trainer=make_trainer(max_epochs=2),
         module=resumed,
         data=make_data(),
         seed=SEED,
@@ -283,5 +304,9 @@ def test_equimod_requeue_resumes_and_matches_uninterrupted(entry_point, monkeypa
         resumed_loss,
         reference_loss,
     )
-    for key, value in reference.backbone.state_dict().items():
-        assert torch.allclose(value, resumed.backbone.state_dict()[key], atol=1e-6), key
+    resumed_state = resumed.state_dict()
+    for key, value in reference.state_dict().items():
+        if value.is_floating_point():
+            assert torch.allclose(value, resumed_state[key], atol=1e-6), key
+        else:
+            assert torch.equal(value, resumed_state[key]), key

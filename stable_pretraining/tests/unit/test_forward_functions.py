@@ -519,10 +519,63 @@ class TestEquiModForward:
         result = forward_module.equimod(module, batch, "fit")
 
         assert result["embedding"].shape == (8, 16)  # two augmented views
-        assert result["label"].shape == (8,)
+        _, v1, v2 = batch["views"]
+        assert torch.equal(result["label"], torch.cat([v1["label"], v2["label"]]))
         assert torch.isfinite(result["loss"])
         logged = {call.args[0] for call in module.log.call_args_list}
         assert logged == {"fit/inv", "fit/equi", "fit/equi_gain", "fit/loss"}
+
+    def test_loss_weight_and_param_keys_are_honoured(self):
+        from stable_pretraining.methods.equimod import EquivarianceModule
+
+        def augmented_with_blur():
+            return transforms.Compose(
+                transforms.RGB(),
+                transforms.RandomResizedCrop((32, 32), scale=(0.2, 1.0)),
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.ColorJitter(
+                    brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1, p=0.8
+                ),
+                transforms.RandomGrayscale(p=0.2),
+                transforms.PILGaussianBlur(p=0.5),  # records the 16th/17th entries
+                transforms.ToImage(**spt.data.static.CIFAR10),
+            )
+
+        torch.manual_seed(0)
+        original = transforms.Compose(
+            transforms.RGB(), transforms.ToImage(**spt.data.static.CIFAR10)
+        )
+        transform = transforms.MultiViewTransform(
+            [original, augmented_with_blur(), augmented_with_blur()]
+        )
+        samples = [
+            transform({"image": _create_dummy_pil_image((32, 32)), "label": i})
+            for i in range(4)
+        ]
+        batch = torch.utils.data.default_collate(samples)
+
+        module = Mock()
+        module.backbone = nn.Sequential(nn.Flatten(), nn.Linear(3 * 32 * 32, 16))
+        module.projector = nn.Linear(16, 8)
+        module.simclr_loss = spt.losses.NTXEntLoss(temperature=0.5)
+        module.equi = EquivarianceModule(
+            16,
+            projector_dims=(16, 8),
+            param_dim=17,
+            param_projector_dims=(8,),
+            weight=0.5,
+            param_keys={"blur": "PILGaussianBlur"},
+        )
+        module.equi_loss = spt.losses.NTXEntLoss(temperature=0.2)
+        module.training = True
+        module.log = Mock()
+
+        result = forward_module.equimod(module, batch, "fit")
+
+        logged = {call.args[0]: call.args[1] for call in module.log.call_args_list}
+        assert torch.allclose(
+            result["loss"], logged["fit/inv"] + 0.5 * logged["fit/equi"], atol=1e-6
+        )
 
     def test_matches_method_class_forward(self):
         model = _equimod_module()
@@ -560,6 +613,19 @@ class TestEquiModForward:
         assert result["embedding"].shape == (4, 16)
         assert torch.equal(result["label"], torch.arange(4))
         assert "loss" not in result
+
+    def test_named_views_dict_is_accepted(self):
+        model = _equimod_module()
+        model.train()
+        model.log = Mock()
+        batch = _equimod_batch(n=4)
+        original, v1, v2 = batch["views"]
+        named = {"views": {"original": original, "view_a": v1, "view_b": v2}}
+        torch.manual_seed(1)
+        from_named = forward_module.equimod(model, named, "fit")
+        torch.manual_seed(1)
+        from_list = forward_module.equimod(model, batch, "fit")
+        assert torch.allclose(from_named["loss"], from_list["loss"], atol=1e-6)
 
     def test_two_views_is_rejected(self):
         model = _equimod_module()

@@ -155,8 +155,23 @@ def test_augmentation_params_with_two_sigma_blur_record():
 
 
 def test_augmentation_params_missing_record_raises():
-    with pytest.raises(KeyError, match="RandomHorizontalFlip"):
+    with pytest.raises(KeyError, match="RandomHorizontalFlip.*RandomResizedCrop"):
         EquiMod.augmentation_params({"RandomResizedCrop": torch.zeros(2, 4)})
+
+
+def test_param_keys_reach_the_equivariance_module():
+    model = _model(param_dim=17, param_keys={"blur": "PILGaussianBlur"})
+    torch.manual_seed(0)
+    views = _collated_views(blur=transforms.PILGaussianBlur(p=0.5))
+    assert model.equi.params_from_view(views[1]).shape == (32, 17)
+
+
+def test_equivariance_module_rejects_non_view_major_rows():
+    model = _model()
+    with pytest.raises(ValueError, match="multiple"):
+        model.equi(
+            torch.randn(3, EMBED_DIM), torch.randn(5, EMBED_DIM), torch.randn(5, 15)
+        )
 
 
 # --- model ------------------------------------------------------------------
